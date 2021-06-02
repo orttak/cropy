@@ -10,6 +10,7 @@ import pandas as pd
 import warnings
 from shapely.geometry import  Polygon
 import rioxarray
+import xarray as xr
 import satstac
 import requests
 from sentinelsat.sentinel import SentinelAPI, read_geojson, geojson_to_wkt
@@ -411,7 +412,9 @@ class Stac():
         return download_path
 
     @staticmethod
-    def download_image(stac_result=None,item_id_list=[],item_list=[] ,band_list=bands_list[:-7],download_path='./sentinel_cog',name_suffix='',auto_folder=True):
+    def download_image(stac_result=None,item_id_list=[],item_list=[] ,
+                        band_list=['B01', 'B02', 'B03', 'B04', 'B05', 'B06', 'B07', 'B08', 'B8A','B11', 'B12'],
+                        download_path='./sentinel_cog',name_suffix='',auto_folder=True):
         """
         There are 3 different download methods in this function. If you don't give any band list, function use default band list.
 
@@ -419,8 +422,7 @@ class Stac():
         2- Use stac result and Sentinel image ID which you can get from show_result_df or show_result_list methods
         3- If you just give the stac result to this function, function download all images in your stac result with default bands. According your time range
         and target area, this method could take more time.
-        default_bands=['B01', 'B02', 'B03', 'B04', 'B05', 'B06', 'B07', 'B08', 'B8A',
-           'B09', 'B11', 'B12']
+        default_bands=['B01', 'B02', 'B03', 'B04', 'B05', 'B06', 'B07', 'B08', 'B8A','B11', 'B12']
         defautl download path > './sentinel_cog'
         """
         if auto_folder:
@@ -447,11 +449,20 @@ class Stac():
 
   
     @staticmethod
-    def __download_subset_items(download_status,item_list,aoi,target_epsg,band_list,
-                            download_path):
+    def __download_subset_items(download_status,
+                            item_list,aoi,
+                            target_epsg,
+                            band_list,
+                            download_path,
+                            cloud_masking,
+                            scl_list,
+                            ):
         result_list=[]
         for item in item_list:
             bands_dict={}
+            if cloud_masking:
+                scl_url=item.assets['SCL']['href']
+                scl_rds = rioxarray.open_rasterio(scl_url, masked=False, chunks=(1, "auto", -1))
             for band in band_list:
                 img_name=item.properties['sentinel:product_id']
                 bands_dict['image_name']=img_name
@@ -462,13 +473,29 @@ class Stac():
                     txt=f'image_id:{item.properties["sentinel:product_id"]},geometry:{item.geometry},date:{item.date} \n'
                     __create_log_file(target_text=txt,filename=download_path+f'/image_error_{item.id}.txt')
                     continue
+                
                 #aoi data from http://geojson.io 
                 # get aoi as geopandas df
                 datajson=json.dumps(aoi)
                 target_area=gpd.read_file(datajson)
                 #https://geopandas.org/projections.html
                 target_area=target_area.to_crs(rds.rio.crs.to_string())
-                clipped =rds.rio.clip(target_area.geometry)
+
+
+                if cloud_masking:
+                    if not rds.rio.resolution()==scl_rds.rio.resolution():
+                        scl_rds=scl_rds.rio.reproject(scl_rds.rio.crs,resolution=rds.rio.resolution())
+                    
+                    scl_clipped =scl_rds.rio.clip(target_area.geometry)
+                    classed_img=xr.DataArray(np.in1d(scl_clipped, scl_list).reshape(scl_clipped.shape),
+                                            dims=scl_clipped.dims, coords=scl_clipped.coords)
+                    clipped =rds.rio.clip(target_area.geometry)
+                    clipped=clipped*~classed_img
+                    clipped.attrs=rds.attrs
+                else:
+                    clipped =rds.rio.clip(target_area.geometry)
+                
+
                 if target_epsg:
                     # target_epsg='epsg:4326'
                     clipped = clipped.rio.reproject(target_epsg)
@@ -490,10 +517,15 @@ class Stac():
         return result_list
 
     @staticmethod
-    def download_subset_image(download_status=False,stac_result=None,item_id_list=[],
+    def download_subset_image(stac_result=None,
+                            item_id_list=[],
                             item_list=[],aoi=None,target_epsg='',
-                            band_list=bands_list[:-5],
-                            download_path='./sentinel_cog'):
+                            band_list=['B01', 'B02', 'B03', 'B04', 'B05', 'B06', 'B07', 'B08', 'B8A','B11', 'B12'],
+                            download_status=False,
+                            download_path='./sentinel_cog',
+                            cloud_masking=False,
+                            scl_list = [3,8,9,10],
+                            ):
         '''
         With this function, you can get subset data from your Stac items.You can get data as xarray that you can convert numpy array and use
         in another function. Also you can directly save the subset image with these parameters >> download_status=True and download_path='your_target_path'
@@ -505,16 +537,31 @@ class Stac():
         3- If you just give the stac result to this function, function download all images in your stac result with default bands. According your time range
         and target area, this method could take more time.
 
-        default_bands=['B01', 'B02', 'B03', 'B04', 'B05', 'B06', 'B07', 'B08', 'B8A',
-           'B09', 'B11', 'B12']
+        default_bands=['B01', 'B02', 'B03', 'B04', 'B05', 'B06', 'B07', 'B08', 'B8A','B11', 'B12']
+
         defautl download path > './sentinel_cog'
+
+        scl_list >> default= [3,8,9,10]
+        SCL Bands List:0 - No data
+        1 - Saturated / Defective
+        2 - Dark Area Pixels
+        3 - Cloud Shadows
+        4 - Vegetation
+        5 - Bare Soils
+        6 - Water
+        7 - Clouds low probability / Unclassified
+        8 - Clouds medium probability
+        9 - Clouds high probability
+        10 - Cirrus
+        11 - Snow / Ice
         '''
 
 
         if item_list:
             result_list=Stac.__download_subset_items(download_status=download_status,item_list=item_list,
             aoi=aoi,target_epsg=target_epsg,band_list=band_list,
-                            download_path=download_path)
+                            download_path=download_path,
+                            cloud_masking=cloud_masking,scl_list=scl_list)
             return result_list
 
         elif item_id_list:
@@ -522,19 +569,19 @@ class Stac():
             items = stac_result.items()
             items.filter('sentinel:product_id',item_id_list)
             result_list=Stac.__download_subset_items(download_status=download_status,item_list=items,
-            aoi=aoi,target_epsg=target_epsg,band_list=band_list,
-                            download_path=download_path)
+                                                    aoi=aoi,target_epsg=target_epsg,band_list=band_list,
+                                                    download_path=download_path,
+                                                    cloud_masking=cloud_masking,scl_list=scl_list)
             return result_list
 
         else:
             items = stac_result.items()
             result_list=Stac.__download_subset_items(download_status=download_status,item_list=items,
             aoi=aoi,target_epsg=target_epsg,band_list=band_list,
-                            download_path=download_path)
+                            download_path=download_path,
+                            cloud_masking=cloud_masking,scl_list=scl_list)
             return result_list
 
-import numpy as np
-import xarray as xr
 
 def xarray_calc_stats(dataset,method,dim_name,input_nodata,input_dtype):
     dataset=dataset.astype(np.float64)
@@ -753,7 +800,7 @@ def create_resampled_image(input_images_folder:str, output_image_folder:str=None
     input_images_list: You can give your image list. Cannot be used
     together with input_images_folder.
     
-    number_of_band: if the images consist of more than one band, you should define this parameter.
+    number_of_band: if the images consist of more than one band, you should define this parameter. e.g RGB, RGBNIR ...
     
     target_band: Target bands under input_images_folder. Default: ['B01', 'B05', 'B06', 'B07', 'B8A','B09', 'B11', 'B12']
     
