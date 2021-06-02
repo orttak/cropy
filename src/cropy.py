@@ -124,6 +124,11 @@ class Stac():
             tile_number_list.append(int(tile[0:2]))
             lat_band_list.append(tile[2])
             grid_sq_list.append(tile[3:])
+        
+        tile_number_list=list(set(tile_number_list))
+        lat_band_list=list(set(lat_band_list))
+        grid_sq_list=list(set(grid_sq_list))
+
         self.stac_items.filter('sentinel:utm_zone',tile_number_list)
         self.stac_items.filter('sentinel:latitude_band',lat_band_list)
         self.stac_items.filter('sentinel:grid_square', grid_sq_list)   
@@ -280,13 +285,14 @@ class Stac():
                 tmp=gpd.GeoDataFrame(items_json)
                 geo_dict = {'geometry': [Polygon(item.geometry['coordinates'][0])]}
                 gdf = gpd.GeoDataFrame(geo_dict, crs="EPSG:4326")
-                #import geo info
                 tmp['geometry']=gdf['geometry']
                 df=df.append(tmp)
                 #change datatime columt datatype
+
             df['datetime']=pd.to_datetime(df['datetime'], infer_datetime_format=True)
             df.reset_index(inplace=True,drop=True)
             return df
+
     @staticmethod       
     def __add_map(items,target_area=None,overview=False):
         center = [38,35]
@@ -558,8 +564,8 @@ def xarray_calc_stats(dataset,method,dim_name,input_nodata,input_dtype):
         dataset_max.rio.write_nodata(input_nodata, inplace=True)
         return dataset_max
 
-def open_image(input_img):
-    rds = rioxarray.open_rasterio(input_img, masked=False, chunks=(1, "auto", -1))
+def open_image(input_img,number_of_band=1):
+    rds = rioxarray.open_rasterio(input_img, masked=False, chunks=(number_of_band, "auto", -1))
     return rds
 
 def calc_img_stat(stac_result:list =[],imgs_list:list=[],numberOfBand:list=[],inputtarget_epsg: str ='epsg:4326',statistic_method: str = 'mean',input_dim_name: str='band',output_dim_name: str='band',input_nodata:int=None,input_dtype=None):
@@ -733,6 +739,73 @@ def create_mosaic(imgs_list:list,reproject=False,target_epsg:str='EPSG:4326',):
     
     merged = merge_arrays(imgs_list)
     return merged
+
+sentinel2_10m_bands=['B02', 'B03', 'B04','B08']
+sentinel2_20m_bands=[ 'B05', 'B06', 'B07', 'B8A','B11', 'B12']
+sentinel2_60m_bands=['B01', 'B09', 'B10']
+def create_resampled_image(input_images_folder:str, output_image_folder:str=None,input_images_list:list=None,number_of_band:int=1,
+                           target_band:list=['B01', 'B05', 'B06', 'B07', 'B8A','B09', 'B11', 'B12'],**kwargs):
+    '''
+    input_images_folder: Finds all target band under this parameter.
+    
+    output_image_folder: If you don't give output folder, function create new folder> default name: resample
+    
+    input_images_list: You can give your image list. Cannot be used
+    together with input_images_folder.
+    
+    number_of_band: if the images consist of more than one band, you should define this parameter.
+    
+    target_band: Target bands under input_images_folder. Default: ['B01', 'B05', 'B06', 'B07', 'B8A','B09', 'B11', 'B12']
+    
+    **kwargs parameters
+    dst_crs: str
+    OGC WKT string or Proj.4 string.
+    
+    resolution: float or tuple(float, float), optional
+    Size of a destination pixel in destination projection units
+    (e.g. degrees or metres).
+    
+    shape: tuple(int, int), optional
+    Shape of the destination in pixels (dst_height, dst_width). Cannot be used
+    together with resolution.
+    
+    transform: optional
+    The destination transform.
+    
+    resampling: Resampling method, optional
+    See rasterio.warp.reproject for more details.
+    '''
+
+    if not input_images_list:
+        input_images_list=[]
+        for band in target_band:
+            tmp_img=glob.glob(f'{input_images_folder}/*{band}*.tif')
+            input_images_list.append(tmp_img[0])
+    
+    for img in input_images_list:
+        
+        if not output_image_folder:
+            img_folder=os.path.dirname(img)
+            try:
+                output_image_folder=os.mkdir(f'{img_folder}/resample')
+            except:
+                output_image_folder=f'{img_folder}/resample'
+            
+        rds = open_image(img,number_of_band)
+        try:
+            dst_crs=kwargs['dst_crs']       
+        except:
+            dst_crs=rds.rio.crs
+            
+        resampling=rds.rio.reproject(dst_crs,**kwargs)
+        basename=os.path.basename(img)
+        resolution=kwargs['resolution']
+        resampling.rio.to_raster(f'{output_image_folder}/{basename[:-4]}_Res{resolution}m.tif')
+        
+    rds=None
+    resampling=None
+    
+
 
 def save_image(input_xarray=None,target_path='target_name.tif',data_type='uint16',nodata_value=0):
     input_xarray.rio.to_raster(target_path,dtype=data_type,tags={'_FillValue': nodata_value})
