@@ -1,0 +1,8 @@
+{
+"type": "FeatureCollection",
+"name": "Harran_AOI",
+"crs": { "type": "name", "properties": { "name": "urn:ogc:def:crs:OGC:1.3:CRS84" } },
+"features": [
+{ "type": "Feature", "properties": { "fid": 1 }, "geometry": { "type": "Polygon", "coordinates": [ [ [ 38.680367610550277, 36.71081864055018 ], [ 38.688923838082594, 37.274751818816462 ], [ 39.282414893278698, 37.277085335416182 ], [ 39.29019328194444, 36.690594830019251 ], [ 38.680367610550277, 36.71081864055018 ] ] ] } }
+]
+}

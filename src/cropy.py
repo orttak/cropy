@@ -16,28 +16,47 @@ import requests
 from sentinelsat.sentinel import SentinelAPI, read_geojson, geojson_to_wkt
 from datetime import date
 import datetime
+import shutil
+from src.s3 import send_file_s3,send_folder_s3
 warnings.filterwarnings("ignore")
 
 
 class VectorProcessing():
     '''
-    Burada isleme gore girdiler tanimlayabiliriz. ilk methodlarimiz hedef alani harita uzerinde gosterme
-    ve sentine_tile ile cakistirma yaparak, hangi sentinel tile ID ler ile kesistigini gosteriyorz.
+    In backend, the system use Geopandas so you can use all input data that is accepted by Geopandas.
+    AOI from http://geojson.io/, and you want to use directly use it as a dict
+        > from src.cropy import VectorProcessing as vp
+        > import json
+        > #target_area from geojson.io and you should copy all item from right panel and paste it. Don't pu extra {} when define target_area.
+        > target area= {} 
+        > datajson=json.dumps(target_area)
+        > area=gpd.read_file(datajson)
+        > cpy.VectorProcessing.show_vector(target_area=area)
+        > m,intersec_df=cpy.VectorProcessing.show_intersection(target_area=area,base_vector_path='sentinel_tiles/sentinel_tr_tiles.shp')
+        
+    AOI from local geojson
+        > aoi_json=open("sample_iou.json")
+        > area=gpd.read_file(aoi_json)
+        > cpy.VectorProcessing.show_vector(target_area=area)
+        > m,intersec_df=cpy.VectorProcessing.show_intersection(target_area=area,base_vector_path='sentinel_tiles/sentinel_tr_tiles.shp')
+    
+    If you have geopandas dataframe, you can use directly with this class
+        > # we supposed that area is geopandas dataframe
+        > cpy.VectorProcessing.show_vector(target_area=area)
+        > m,intersec_df=cpy.VectorProcessing.show_intersection(target_area=area,base_vector_path='sentinel_tiles/sentinel_tr_tiles.shp')
+
     '''
-    def __init__(self,target_area,):
+    def __init__(self,target_area):
         #target_area tipine gore girdimizi tanimliyoruz
         #bu yapiyi ornegin, nokta verisi ile bir islem ekledigimiz zaman farkli bir isim ile onada yapabiliriz
         # nokta_input== xxx >> self.nokta_input=nokta_input seklinde
-        if isinstance(target_area,dict):
-            datajson=json.dumps(target_area)
-            self.target_area=gpd.read_file(datajson)
-        elif isinstance(target_area,gpd.geodataframe.GeoDataFrame):
+        if isinstance(target_area,gpd.geodataframe.GeoDataFrame):
             self.target_area=target_area
+        elif isinstance(target_area,gpd.geodataframe.GeoDataFrame):
+            self.target_area=gpd.read_file(target_area)
         else:
-            raise DataError
+            raise TypeError
 
-        
-    
     # methoda bir class objesi yaratmadan hemde class degiskenelrini kullanmak icin @classmethod kullandik
     @classmethod
     def show_vector(cls,target_area):
@@ -306,7 +325,8 @@ class Stac():
             elif isinstance(target_area,gpd.geodataframe.GeoDataFrame):
                 target_area=target_area
             else:
-                raise DataError
+                raise TypeError
+                
             geo=target_area.__geo_interface__
             m.add_child(folium.GeoJson(geo, name='Area of Study',
                            style_function=lambda x: {'color': 'red', 'alpha': 0}))
@@ -399,24 +419,70 @@ class Stac():
 
         
     @staticmethod
-    def __download_items(item_list,band_list,download_path,name_suffix):
-        for item in item_list:
-            try:
-                for band in band_list:
-                    item.download(band,filename_template=download_path+'/'+name_suffix)
-            except:
-                txt=f'image_id:{item.properties["sentinel:product_id"]},geometry:{item.geometry},date:{item.date} \n'
-                __create_log_file(target_text=txt,filename=download_path+f'/image_error_{item.id}.txt')
-                continue
+    def __download_items(
+        item_list, 
+        band_list, 
+        download_path, 
+        name_suffix,
+        cloud_masking,
+        scl_list,
+        send_s3,
+        bucket_name):
         
+        for item in item_list:
+            img_id = item.id
+            img_date = str(item.date)
+            img_path = os.path.join(download_path,img_date,img_id)
+            if not os.path.isdir(download_path):
+                os.makedirs(download_path)                        
+            if not os.path.isdir(img_path):
+                 os.makedirs(img_path)
+
+
+            if cloud_masking:
+                scl_url=item.assets['SCL']['href']
+                scl_rds = rioxarray.open_rasterio(scl_url, masked=False, chunks=(1, "auto", -1))
+            for band in band_list:
+                if cloud_masking:
+                    band_url=item.assets[band]['href']
+                    rds = rioxarray.open_rasterio(band_url, masked=False, chunks=(1, "auto", -1))
+                    if not rds.rio.resolution()==scl_rds.rio.resolution():
+                        scl_rds=scl_rds.rio.reproject(scl_rds.rio.crs,resolution=rds.rio.resolution())
+                    classed_img=xr.DataArray(np.in1d(scl_rds, scl_list).reshape(scl_rds.shape),
+                        dims=scl_rds.dims, coords=scl_rds.coords)
+                    rds = rds*~classed_img
+                    img_name = f'{img_id}_{band}_subset.tif'
+                    img_path = os.path.join(img_path,img_name)
+                    rds.rio.to_raster(img_path)
+                    if send_s3:
+                        target_img_path = os.path.join(img_date,img_id,img_name)
+                        send_file_s3(img_path,bucket_name,target_img_path)
+                        rds=None
+                        os.remove(img_path)
+                        
+                    rds=None
+                else:
+                    item.download(band,filename_template=download_path+'/'+name_suffix)
+                    if send_s3:
+                        #img_path = os.path.join(download_path,img_date,img_id)
+                        #if user add name suffix this function doesn't work
+                        img_name = f'{img_id}__{band}.tif'
+                        img_full_path = os.path.join(img_path,img_name)
+                        #target_img_path is created for s3's file structure
+                        target_img_path = os.path.join(img_date,img_id,img_name)
+                        send_file_s3(img_full_path,bucket_name,target_img_path)
+                        shutil.rmtree(img_path,ignore_errors=True)
         return download_path
 
     @staticmethod
-    def download_image(stac_result=None,item_id_list=[],item_list=[] ,
+    def download_image(stac_result=None,item_id_list=[],item_list=[],
                         band_list=['B01', 'B02', 'B03', 'B04', 'B05', 'B06', 'B07', 'B08', 'B8A','B11', 'B12'],
-                        download_path='./sentinel_cog',name_suffix='',auto_folder=True):
+                        download_path='./sentinel_cog',name_suffix='',auto_folder=True, 
+                        cloud_masking=False,scl_list = [3,8,9,10],
+                        send_s3=False,
+                        bucket_name=None):
         """
-        There are 3 different download methods in this function. If you don't give any band list, function use default band list.
+        There are 3 different download methods (Also, you can use cloud_masking method with them) in this function. If you don't give any band list, function use default band list.
 
         1- Use item_list from "stac_result.find_sentinel_item()" method
         2- Use stac result and Sentinel image ID which you can get from show_result_df or show_result_list methods
@@ -424,6 +490,25 @@ class Stac():
         and target area, this method could take more time.
         default_bands=['B01', 'B02', 'B03', 'B04', 'B05', 'B06', 'B07', 'B08', 'B8A','B11', 'B12']
         defautl download path > './sentinel_cog'
+        
+        If cloud_masking=True, method create new masked raster file according to scl_list.
+        
+        scl_list >> default= [3,8,9,10]
+        SCL Bands List:0 - No data
+        1 - Saturated / Defective
+        2 - Dark Area Pixels
+        3 - Cloud Shadows
+        4 - Vegetation
+        5 - Bare Soils
+        6 - Water
+        7 - Clouds low probability / Unclassified
+        8 - Clouds medium probability
+        9 - Clouds high probability
+        10 - Cirrus
+        11 - Snow / Ice
+        
+        
+        #Future requests: We can add user's mask layer as a parameter. With that, we can use land cover dataset as a mask before download image.
         """
         if auto_folder:
             # we cam get date/id info from stac item
@@ -434,18 +519,17 @@ class Stac():
             name_suffix=name_suffix
 
         if item_list:
-            return Stac.__download_items(item_list=item_list,band_list=band_list,
-                                    download_path=download_path,name_suffix=name_suffix)
+            return Stac.__download_items(item_list=item_list,band_list=band_list, download_path=download_path, name_suffix=name_suffix, cloud_masking=cloud_masking, scl_list=scl_list, send_s3=send_s3, bucket_name=bucket_name)
         
         elif item_id_list:
             # sampel list= ['S2A_MSIL2A_20200711T080611_N0214_R078_T37SDA_20200711T112854','S2A_MSIL2A_20200711T080611_N0214_R078_T37SDA_20200711T112854']
             items = stac_result.items()
             items.filter('sentinel:product_id',item_id_list)
-            return Stac.__download_items(items,band_list,download_path,name_suffix)
+            return Stac.__download_items( items,band_list,download_path,name_suffix,cloud_masking=cloud_masking, scl_list=scl_list,send_s3=send_s3,bucket_name=bucket_name)
 
         else:
             items = stac_result.items()
-            return Stac.__download_items(items,band_list,download_path,name_suffix)       
+            return Stac.__download_items(items,band_list,download_path,name_suffix,cloud_masking=cloud_masking, scl_list=scl_list, send_s3=send_s3, bucket_name=bucket_name )       
 
   
     @staticmethod
@@ -464,14 +548,14 @@ class Stac():
                 scl_url=item.assets['SCL']['href']
                 scl_rds = rioxarray.open_rasterio(scl_url, masked=False, chunks=(1, "auto", -1))
             for band in band_list:
-                img_name=item.properties['sentinel:product_id']
-                bands_dict['image_name']=img_name
+                img_id=item.id
+                bands_dict['image_name']=img_id
                 band_url=item.assets[band]['href']
                 try:
                     rds = rioxarray.open_rasterio(band_url, masked=False, chunks=(1, "auto", -1))
                 except:
-                    txt=f'image_id:{item.properties["sentinel:product_id"]},geometry:{item.geometry},date:{item.date} \n'
-                    __create_log_file(target_text=txt,filename=download_path+f'/image_error_{item.id}.txt')
+                    txt=f'image_id:{item.id},geometry:{item.geometry},date:{item.date} \n'
+                    Stac.__create_log_file(target_text=txt,filename=download_path+f'/image_error_{item.id}.txt')
                     continue
                 
                 #aoi data from http://geojson.io 
@@ -500,13 +584,15 @@ class Stac():
                     # target_epsg='epsg:4326'
                     clipped = clipped.rio.reproject(target_epsg)
                 if download_status:
-                    img_path=download_path+'/'+img_name
+                    img_date=str(item.date)
+                    img_path=os.path.join(download_path,img_date,img_id)
                     if not os.path.isdir(download_path):
-                        os.mkdir(download_path)                        
+                        os.makedirs(download_path)                        
                     if not os.path.isdir(img_path):
-                        os.mkdir(img_path)
-                    img_name=band+'_subset.tif'
-                    clipped.rio.to_raster(img_path+'/'+img_name)
+                        os.makedirs(img_path)
+                    img_name=f'{img_id}_{band}_subset.tif'
+                    img_path=os.path.join(img_path,img_name)
+                    clipped.rio.to_raster(img_path)
                 band_clipped=clipped.copy()
                 bands_dict[band]=band_clipped
                 rds=None
@@ -790,6 +876,7 @@ def create_mosaic(imgs_list:list,reproject=False,target_epsg:str='EPSG:4326',):
 sentinel2_10m_bands=['B02', 'B03', 'B04','B08']
 sentinel2_20m_bands=[ 'B05', 'B06', 'B07', 'B8A','B11', 'B12']
 sentinel2_60m_bands=['B01', 'B09', 'B10']
+
 def create_resampled_image(input_images_folder:str, output_image_folder:str=None,input_images_list:list=None,number_of_band:int=1,
                            target_band:list=['B01', 'B05', 'B06', 'B07', 'B8A','B09', 'B11', 'B12'],**kwargs):
     '''
@@ -826,7 +913,7 @@ def create_resampled_image(input_images_folder:str, output_image_folder:str=None
     if not input_images_list:
         input_images_list=[]
         for band in target_band:
-            tmp_img=glob.glob(f'{input_images_folder}/*{band}*.tif')
+            tmp_img=glob(f'{input_images_folder}/*{band}*.tif')
             input_images_list.append(tmp_img[0])
     
     for img in input_images_list:
