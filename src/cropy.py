@@ -118,11 +118,13 @@ class Stac():
         self.stac_result = satsearch.Search.search(url=self.URL,collections=['sentinel-s2-l2a-cogs'],
                                 datetime=self.date,
                                 bbox=self.target_aoi,
-                                query={'eo:cloud_cover': {'lt':self.max_cloud}}, )
+                                query={'eo:cloud_cover': {'lt':self.max_cloud},
+                                      'sentinel:valid_cloud_cover': {"eq": True}
+                                      }, )
         
         self.stac_items=self.stac_result.items()
         self.tiles_list=[]
-        self.min_coverage=95
+        self.min_coverage=80
 
     def create_tiles_list(self):
         items = self.stac_result.items()
@@ -140,7 +142,8 @@ class Stac():
         tile_number_list=[]
         lat_band_list=[]
         grid_sq_list=[]
-        for tile in self.tiles_list:            
+        for tile in self.tiles_list:
+            #T37KMD
             tile_number_list.append(int(tile[0:2]))
             lat_band_list.append(tile[2])
             grid_sq_list.append(tile[3:])
@@ -166,47 +169,52 @@ class Stac():
             tmp_items.filter('sentinel:latitude_band',[lat_band])
             tmp_items.filter('sentinel:grid_square', [grid_sq])
             try:
+                #print(sorted(tmp_items.properties('sentinel:data_coverage')))
                 coverage=sorted(tmp_items.properties('sentinel:data_coverage'))
                 #self.min_coverage=95. 95 den buyuk coverage sahip goruntuleri aliyoruz
                 coverage_sorted=[c for c in coverage if c>=self.min_coverage]
                 if coverage_sorted:
                     tmp_items.filter('sentinel:data_coverage',coverage_sorted)
                 else:
-                    coverage_sorted=coverage[-2:]
+                    coverage_sorted=coverage[-3:]
                     tmp_items.filter('sentinel:data_coverage',coverage_sorted)
+                    
+                #print(sorted(tmp_items.properties('eo:cloud_cover')))
+                
 
+                #eliminate the coverage filter. we should check it
+                selected_item=sorted(tmp_items.properties('eo:cloud_cover'))[0]
+                tmp_items.filter('eo:cloud_cover', [selected_item])
+                tile_result_list.append(tmp_items[0])
+                
+                """
                 if 100 in tmp_items.properties('sentinel:data_coverage'):
                     tmp_items.filter('sentinel:data_coverage',[100])
+                    print(10000000000000000000000000)
+                    print("before")
+                    print(sorted(tmp_items.properties('eo:cloud_cover')))
+                    print("after")
+
                     #get images cloud info
                     selected_item=sorted(tmp_items.properties('eo:cloud_cover'))[0]
                     tmp_items.filter('eo:cloud_cover', [selected_item])
+                    print(sorted(tmp_items.properties('eo:cloud_cover')))
                     
-                    '''
-                    #burada %2 den kucuk olana sorgu atip, tekrar sort yaptiktan sonra en dusuk olani almak ile
-                    # direk en kucuk olani almak ayni sey:D 
-                    #test ile kontrol edilecek
-                    filtered_list=[tmp_items[x].properties['eo:cloud_cover'] for i, x in enumerate(dc_index) if tmp_items[x].properties['eo:cloud_cover']<self.max_cloud] 
-                    # if data exist we use filter method
-                    if filtered_list:
-                        #get first cloud cover after sorting
-                        selected_item=sorted(filtered_list)[0]
-                        tmp_items.filter('sentinel:data_coverage',[100])
-
-                    else:
-                        #get the min cloud coverage
-                        selected_item=sorted(tmp_items.properties('eo:cloud_cover'))[0]
-                        tmp_items.filter('eo:cloud_cover', [selected_item])
-                    '''
                     
                     tile_result_list.append(tmp_items[0])
 
                 else:
                     selected_item=sorted(tmp_items.properties('eo:cloud_cover'))[0]
+                    print("900000000000000000")
+                    print("before")
+                    print(sorted(tmp_items.properties('eo:cloud_cover')))
+                    print("after")
                     #select best image
                     tmp_items.filter('eo:cloud_cover', [selected_item])
+                    print(sorted(tmp_items.properties('eo:cloud_cover')))
                     #get newest image
                     tile_result_list.append(tmp_items[0])
-                
+                """
                 if not tmp_items:
                     raise IndexError
             except:
@@ -445,20 +453,36 @@ class Stac():
             for band in band_list:
                 if cloud_masking:
                     band_url=item.assets[band]['href']
+                    #read target band
                     rds = rioxarray.open_rasterio(band_url, masked=False, chunks=(1, "auto", -1))
+                    #scl_rds has different resolution so we chanhe the resolution according to input band
                     if not rds.rio.resolution()==scl_rds.rio.resolution():
                         scl_rds=scl_rds.rio.reproject(scl_rds.rio.crs,resolution=rds.rio.resolution())
+                    
                     classed_img=xr.DataArray(np.in1d(scl_rds, scl_list).reshape(scl_rds.shape),
                         dims=scl_rds.dims, coords=scl_rds.coords)
+                    #masking part
                     rds = rds*~classed_img
                     img_name = f'{img_id}_{band}_subset.tif'
-                    img_path = os.path.join(img_path,img_name)
-                    rds.rio.to_raster(img_path)
+                    tif_path = os.path.join(img_path,img_name)
+                    #save tif file
+                    rds.rio.to_raster(tif_path)
                     if send_s3:
-                        target_img_path = os.path.join(img_date,img_id,img_name)
-                        send_file_s3(img_path,bucket_name,target_img_path)
+                        # download_path="./target_folder1",
+                        # if tif_path == target_folder1/dateOfImage/sentinelTileID/output.tif
+                        # s3 path will be > bucket_name/target_folder1/dateOfImage/sentinelTileID/output.tif
+                        # os.path.basename(download_path) > bunun anlami, download_path string'i icinde bulunan 
+                        # son dosya ismini alarak, bucket icine bu isimde bir dosya acar.
+                        # download_path= output_path_family/child/grandChild
+                        # bucket path will be >> bucket_name/grandChild/img_date/img_id/img_name
+                        #img_date/img_id/img_name > bu yapi bant degerinden otomatik olusturuluyor.
+                        # kullanici sadece bucket altinda hangi proje oldugunu download_path ile belirtmis oluyor.
+                        target_img_path = os.path.join(os.path.basename(download_path),img_date,img_id,img_name)
+                        send_file_s3(tif_path,bucket_name,target_img_path)
                         rds=None
-                        os.remove(img_path)
+                        #delete file from local
+                        # burasi parametrik olabilir.
+                        os.remove(tif_path)
                         
                     rds=None
                 else:
@@ -469,7 +493,7 @@ class Stac():
                         img_name = f'{img_id}__{band}.tif'
                         img_full_path = os.path.join(img_path,img_name)
                         #target_img_path is created for s3's file structure
-                        target_img_path = os.path.join(img_date,img_id,img_name)
+                        target_img_path = os.path.join(os.path.basename(download_path),img_date,img_id,img_name)
                         send_file_s3(img_full_path,bucket_name,target_img_path)
                         shutil.rmtree(img_path,ignore_errors=True)
         return download_path
@@ -580,9 +604,7 @@ class Stac():
                     clipped =rds.rio.clip(target_area.geometry)
                 
 
-                if target_epsg:
-                    # target_epsg='epsg:4326'
-                    clipped = clipped.rio.reproject(target_epsg)
+                
                 if download_status:
                     img_date=str(item.date)
                     img_path=os.path.join(download_path,img_date,img_id)
@@ -601,6 +623,182 @@ class Stac():
             #for manage the clipped image
             result_list.append(bands_dict)
         return result_list
+        
+    @staticmethod
+    def __download_subset_items2(
+            item_list,
+            aoi,
+            band_list, 
+            download_path,
+            download_status,
+            target_epsg,
+            cloud_masking,
+            scl_list,
+            send_s3,
+            bucket_name,
+            delete_local=True):
+            
+            result_list=[]
+            for item in item_list:
+                bands_dict={}
+                img_id = item.id
+                img_date = str(item.date)
+                img_path = os.path.join(download_path,img_date,img_id)
+                if not os.path.isdir(download_path):
+                    os.makedirs(download_path)                        
+                if not os.path.isdir(img_path):
+                     os.makedirs(img_path)
+    
+                if cloud_masking:
+                    scl_url=item.assets['SCL']['href']
+                    scl_rds = rioxarray.open_rasterio(scl_url, masked=True, chunks=(1, "auto", -1))
+                for band in band_list:
+                    
+                    band_url=item.assets[band]['href']
+                    try:
+                        rds = rioxarray.open_rasterio(band_url, masked=True, chunks=(1, "auto", -1))
+                    except:
+                        txt=f'image_id:{item.id},geometry:{item.geometry},date:{item.date} \n'
+                        Stac.__create_log_file(target_text=txt,filename=download_path+f'/image_error_{item.id}.txt')
+                        continue
+                    
+                    #aoi data from http://geojson.io 
+                    # get aoi as geopandas df
+                    datajson=json.dumps(aoi)
+                    target_area=gpd.read_file(datajson)
+                    #https://geopandas.org/projections.html
+                    target_area=target_area.to_crs(rds.rio.crs.to_string())
+    
+                    if cloud_masking:
+                        if not rds.rio.resolution()==scl_rds.rio.resolution():
+                            scl_rds=scl_rds.rio.reproject(scl_rds.rio.crs,resolution=rds.rio.resolution())
+                        
+                        scl_clipped =scl_rds.rio.clip(target_area.geometry)
+                        classed_img=xr.DataArray(np.in1d(scl_clipped, scl_list).reshape(scl_clipped.shape),
+                                                dims=scl_clipped.dims, coords=scl_clipped.coords)
+                        clipped =rds.rio.clip(target_area.geometry)
+                        clipped=clipped*~classed_img
+                        clipped.attrs=rds.attrs
+                        rds=None
+                    else:
+                        clipped =rds.rio.clip(target_area.geometry)
+                        clipped.attrs=rds.attrs
+                        
+                    if target_epsg:
+                        # target_epsg='epsg:4326'
+                        clipped = clipped.rio.reproject(target_epsg)
+                    if download_status:
+                        img_name = f'{img_id}_{band}_subset.tif'
+                        tif_path = os.path.join(img_path,img_name)
+                        clipped.rio.to_raster(tif_path)
+                        if send_s3:
+                            target_img_path = os.path.join(os.path.basename(download_path),img_date,img_id,img_name)
+                            send_file_s3(tif_path,bucket_name,target_img_path)
+                            clipped=None
+                            if delete_local:
+                                os.remove(tif_path)
+                             
+                    else:
+                        band_clipped=clipped.copy()
+                        bands_dict[band]=band_clipped
+            
+                result_list.append(bands_dict)
+                
+            return result_list
+
+
+    @staticmethod
+    def download_subset_image2(stac_result=None,
+                            item_id_list=None,
+                            item_list=None,
+                            aoi=None,
+                            target_epsg=None,
+                            band_list=['B01', 'B02', 'B03', 'B04', 'B05', 'B06', 'B07', 'B08', 'B8A','B11', 'B12'],
+                            download_status=False,
+                            download_path='./sentinel_cog',
+                            cloud_masking=False,
+                            scl_list = [3,8,9,10],
+                            send_s3=None,
+                            bucket_name=None,
+                            delete_local=True
+                            ):
+        '''
+        With this function, you can get subset data from your Stac items.You can get data as xarray that you can convert numpy array and use
+        in another function. Also you can directly save the subset image with these parameters >> download_status=True and download_path='your_target_path'
+
+        There are 3 different download methods in this function. Also, If you don't give any band list, function use default band list.
+
+        1- Use item_list from "stac_result.find_sentinel_item()" method
+        2- Use stac result and Sentinel image ID which you can get from show_result_df or show_result_list methods
+        3- If you just give the stac result to this function, function download all images in your stac result with default bands. According your time range
+        and target area, this method could take more time.
+
+        default_bands=['B01', 'B02', 'B03', 'B04', 'B05', 'B06', 'B07', 'B08', 'B8A','B11', 'B12']
+
+        defautl download path > './sentinel_cog'
+
+        scl_list >> default= [3,8,9,10]
+        SCL Bands List:0 - No data
+        1 - Saturated / Defective
+        2 - Dark Area Pixels
+        3 - Cloud Shadows
+        4 - Vegetation
+        5 - Bare Soils
+        6 - Water
+        7 - Clouds low probability / Unclassified
+        8 - Clouds medium probability
+        9 - Clouds high probability
+        10 - Cirrus
+        11 - Snow / Ice
+        '''
+
+
+        if item_list:
+            result_list=Stac.__download_subset_items2(
+                download_status=download_status, 
+                item_list=item_list,
+                aoi=aoi,target_epsg=target_epsg, 
+                band_list=band_list,
+                download_path=download_path,
+                cloud_masking=cloud_masking, 
+                scl_list=scl_list,
+                send_s3=send_s3,
+                bucket_name=bucket_name, 
+                delete_local=delete_local)
+            return result_list
+        elif item_id_list:
+            # sampel list= ['S2A_MSIL2A_20200711T080611_N0214_R078_T37SDA_20200711T112854','S2A_MSIL2A_20200711T080611_N0214_R078_T37SDA_20200711T112854']
+            items = stac_result.items()
+            items.filter('sentinel:product_id',item_id_list)
+
+            result_list=Stac.__download_subset_items2(
+                download_status=download_status, 
+                item_list=items,
+                aoi=aoi,target_epsg=target_epsg, 
+                band_list=band_list,
+                download_path=download_path,
+                cloud_masking=cloud_masking, 
+                scl_list=scl_list,
+                send_s3=send_s3,
+                bucket_name=bucket_name, 
+                delete_local=delete_local)
+            return result_list
+
+        else:
+            items = stac_result.items()
+            result_list=Stac.__download_subset_items2(
+                download_status=download_status, 
+                item_list=items,
+                aoi=aoi,target_epsg=target_epsg, 
+                band_list=band_list,
+                download_path=download_path,
+                cloud_masking=cloud_masking, 
+                scl_list=scl_list,
+                send_s3=send_s3,
+                bucket_name=bucket_name, 
+                delete_local=delete_local)
+            return result_list
+    
 
     @staticmethod
     def download_subset_image(stac_result=None,
